@@ -1,5 +1,6 @@
-# From https://github.com/aviralkumar2907/CQL/blob/master/d4rl/rlkit/torch/sac/cql.py
-
+# Conservative Q-Learning for Offline Reinforcement Learning 2020 [CQL]
+# https://arxiv.org/abs/2006.04779
+# The code is from https://github.com/aviralkumar2907/CQL/blob/master/d4rl/rlkit/torch/sac/cql.py
 
 from collections import OrderedDict
 
@@ -7,29 +8,26 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch import nn as nn
-
-import rlkit.torch.pytorch_util as ptu
-from rlkit.core.eval_util import create_stats_ordered_dict
-from rlkit.torch.torch_rl_algorithm import TorchTrainer
 from torch import autograd
+from armin_utils.pytorch import tensor
+torch.autograd.set_detect_anomaly(True)
 
- 
-class CQLTrainer:
+
+class CQL:
     def __init__(
             self, 
-            env,
             policy,
             qf1,
             qf2,
             target_qf1,
             target_qf2,
+            action_dim,
             discount=0.99,
             reward_scale=1.0,
             policy_lr=1e-3,
             qf_lr=1e-3,
             optimizer_class=optim.Adam,
             soft_target_tau=1e-2,
-            plotter=None,
             render_eval_paths=False,
             use_automatic_entropy_tuning=True,
             target_entropy=None,
@@ -45,12 +43,12 @@ class CQLTrainer:
             lagrange_thresh=0.0):
         
         super().__init__()
-        self.env = env
         self.policy = policy
         self.qf1 = qf1
         self.qf2 = qf2
         self.target_qf1 = target_qf1
         self.target_qf2 = target_qf2
+        self.action_dim = action_dim
         self.soft_target_tau = soft_target_tau
 
         self.use_automatic_entropy_tuning = use_automatic_entropy_tuning
@@ -58,18 +56,16 @@ class CQLTrainer:
             if target_entropy:
                 self.target_entropy = target_entropy
             else:
-                self.target_entropy = -np.prod(self.env.action_space.shape).item() 
-            self.log_alpha = ptu.zeros(1, requires_grad=True)
+                self.target_entropy = -np.prod(self.action_dim).item()
+            self.log_alpha = tensor.zeros(1, grad=True)
             self.alpha_optimizer = optimizer_class([self.log_alpha], lr=policy_lr)
         
         self.with_lagrange = with_lagrange
         if self.with_lagrange:
             self.target_action_gap = lagrange_thresh
-            self.log_alpha_prime = ptu.zeros(1, requires_grad=True)
+            self.log_alpha_prime = tensor.zeros(1, grad=True)
             self.alpha_prime_optimizer = optimizer_class([self.log_alpha_prime], lr=qf_lr)
 
-        self.plotter = plotter
-        self.render_eval_paths = render_eval_paths
 
         self.qf_criterion = nn.MSELoss()
         self.vf_criterion = nn.MSELoss()
@@ -80,7 +76,6 @@ class CQLTrainer:
 
         self.discount = discount
         self.reward_scale = reward_scale
-        self.eval_statistics = OrderedDict()
         self._n_train_steps_total = 0
         self._need_to_update_eval_statistics = True
         self.policy_eval_start = policy_eval_start
@@ -101,7 +96,7 @@ class CQLTrainer:
         self.discrete = False
     
     
-    def train(self, np_batch):
+    def train2(self, np_batch):
         self._num_train_steps += 1
         batch = np_to_pytorch_batch(np_batch)
         self.train_from_torch(batch)
@@ -116,22 +111,27 @@ class CQLTrainer:
         preds = preds.view(obs.shape[0], num_repeat, 1)
         return preds
 
+
     def _get_policy_actions(self, obs, num_actions, network=None):
+        print('obs.size()', obs.size())
         obs_temp = obs.unsqueeze(1).repeat(1, num_actions, 1).view(obs.shape[0] * num_actions, obs.shape[1])
+        print('obs_temp.size()', obs_temp.size())
         new_obs_actions, _, _, new_obs_log_pi, *_ = network(obs_temp, reparameterize=True, return_log_prob=True)
         if not self.discrete:
             return new_obs_actions, new_obs_log_pi.view(obs.shape[0], num_actions, 1)
         else:
             return new_obs_actions
 
-    def train_from_torch(self, batch):
+
+    def train(self, batch):
         self._current_epoch += 1
         rewards = batch['rewards']
-        terminals = batch['terminals']
+        truncations = batch['truncations']
+        terminals = batch['truncations']
         obs = batch['observations']
         actions = batch['actions']
         next_obs = batch['next_observations']
-        new_obs_actions, policy_mean, policy_log_std, log_pi, *_ = self.policy(obs, reparameterize=True, return_log_prob=True)
+        actions_policy, policy_mean, policy_log_std, log_pi, *_ = self.policy(obs, reparameterize=True, return_log_prob=True)
         
         if self.use_automatic_entropy_tuning:
             alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
@@ -144,15 +144,16 @@ class CQLTrainer:
             alpha = 1
 
         if self.num_qs == 1:
-            q_new_actions = self.qf1(obs, new_obs_actions)
+            q_new_actions = self.qf1(obs, actions_policy)
         else:
-            q_new_actions = torch.min(self.qf1(obs, new_obs_actions), self.qf2(obs, new_obs_actions))
+            q_new_actions = torch.min(self.qf1(obs, actions_policy), self.qf2(obs, actions_policy))
 
         policy_loss = (alpha*log_pi - q_new_actions).mean()
-
+        # print('Policy Loss', policy_loss)
         if self._current_epoch < self.policy_eval_start:
             policy_log_prob = self.policy.log_prob(obs, actions)
-            policy_loss = (alpha * log_pi - policy_log_prob).mean()
+            policy_loss = (alpha*log_pi - policy_log_prob).mean()
+            
 
         q1_pred = self.qf1(obs, actions)
         if self.num_qs > 1:
@@ -245,115 +246,18 @@ class CQLTrainer:
             self._need_to_update_eval_statistics = False
             policy_loss = (log_pi - q_new_actions).mean()
 
-            self.eval_statistics['QF1 Loss'] = np.mean(ptu.get_numpy(qf1_loss))
-            self.eval_statistics['min QF1 Loss'] = np.mean(ptu.get_numpy(min_qf1_loss))
-            if self.num_qs > 1:
-                self.eval_statistics['QF2 Loss'] = np.mean(ptu.get_numpy(qf2_loss))
-                self.eval_statistics['min QF2 Loss'] = np.mean(ptu.get_numpy(min_qf2_loss))
-
-            if not self.discrete:
-                self.eval_statistics['Std QF1 values'] = np.mean(ptu.get_numpy(std_q1))
-                self.eval_statistics['Std QF2 values'] = np.mean(ptu.get_numpy(std_q2))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'QF1 in-distribution values',
-                    ptu.get_numpy(q1_curr_actions),
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'QF2 in-distribution values',
-                    ptu.get_numpy(q2_curr_actions),
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'QF1 random values',
-                    ptu.get_numpy(q1_rand),
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'QF2 random values',
-                    ptu.get_numpy(q2_rand),
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'QF1 next_actions values',
-                    ptu.get_numpy(q1_next_actions),
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'QF2 next_actions values',
-                    ptu.get_numpy(q2_next_actions),
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'actions', 
-                    ptu.get_numpy(actions)
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'rewards',
-                    ptu.get_numpy(rewards)
-                ))
-
-            self.eval_statistics['Num Q Updates'] = self._num_q_update_steps
-            self.eval_statistics['Num Policy Updates'] = self._num_policy_update_steps
-            self.eval_statistics['Policy Loss'] = np.mean(ptu.get_numpy(
-                policy_loss
-            ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Q1 Predictions',
-                ptu.get_numpy(q1_pred),
-            ))
-            if self.num_qs > 1:
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'Q2 Predictions',
-                    ptu.get_numpy(q2_pred),
-                ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Q Targets',
-                ptu.get_numpy(q_target),
-            ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Log Pis',
-                ptu.get_numpy(log_pi),
-            ))
-            if not self.discrete:
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'Policy mu',
-                    ptu.get_numpy(policy_mean),
-                ))
-                self.eval_statistics.update(create_stats_ordered_dict(
-                    'Policy log std',
-                    ptu.get_numpy(policy_log_std),
-                ))
-            
-            if self.use_automatic_entropy_tuning:
-                self.eval_statistics['Alpha'] = alpha.item()
-                self.eval_statistics['Alpha Loss'] = alpha_loss.item()
-            
-            if self.with_lagrange:
-                self.eval_statistics['Alpha_prime'] = alpha_prime.item()
-                self.eval_statistics['min_q1_loss'] = ptu.get_numpy(min_qf1_loss).mean()
-                self.eval_statistics['min_q2_loss'] = ptu.get_numpy(min_qf2_loss).mean()
-                self.eval_statistics['threshold action gap'] = self.target_action_gap
-                self.eval_statistics['alpha prime loss'] = alpha_prime_loss.item()
-            
         self._n_train_steps_total += 1
 
-    def get_diagnostics(self):
-        return self.eval_statistics
 
     def end_epoch(self, epoch):
         self._need_to_update_eval_statistics = True
 
+
     @property
     def networks(self):
-        base_list = [
-            self.policy,
-            self.qf1,
-            self.qf2,
-            self.target_qf1,
-            self.target_qf2,
-        ]
+        base_list = [self.policy,self.qf1,self.qf2,self.target_qf1,self.target_qf2]
         return base_list
 
+
     def get_snapshot(self):
-        return dict(
-            policy=self.policy,
-            qf1=self.qf1,
-            qf2=self.qf2,
-            target_qf1=self.target_qf1,
-            target_qf2=self.target_qf2,
-        )
+        return dict(policy=self.policy,qf1=self.qf1,qf2=self.qf2,target_qf1=self.target_qf1,target_qf2=self.target_qf2)
